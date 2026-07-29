@@ -4,13 +4,14 @@ on:
   push:
     paths:
       - '.github/workflows/fix-rdl-parameter-layout.yml'
+      - '.github/rdl-layout-trigger'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   fix-rdl:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,5 +72,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add artifacts/production-order-material-planning-final-optimized-parameter-layout-fixed.rdl
-          git commit -m "Fix RDL parameter panel layout"
+          git diff --cached --quiet || git commit -m "Fix RDL parameter panel layout"
           git push
