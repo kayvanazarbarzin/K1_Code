@@ -1,0 +1,1027 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition" xmlns:rd="http://schemas.microsoft.com/SQLServer/reporting/reportdesigner">
+  <rd:ReportUnitType>Inch</rd:ReportUnitType>
+  <rd:ReportID>9d15e4ac-421d-4e5f-a285-921581392bd2</rd:ReportID>
+  <AutoRefresh>0</AutoRefresh>
+  <DataSources>
+    <DataSource Name="Pooyesh">
+      <DataSourceReference>/DataSources/SgDataSource</DataSourceReference>
+      <rd:SecurityType>None</rd:SecurityType>
+    </DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name="DataSet1">
+      <Query>
+        <DataSourceName>Pooyesh</DataSourceName>
+        <QueryParameters>
+          <QueryParameter Name="@Pro"><Value>=Parameters!Pro.Value</Value></QueryParameter>
+          <QueryParameter Name="@StartDate"><Value>=Parameters!StartDate.Value</Value></QueryParameter>
+          <QueryParameter Name="@EndDate"><Value>=Parameters!EndDate.Value</Value></QueryParameter>
+        </QueryParameters>
+        <CommandText><![CDATA[
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+SET ARITHABORT ON;
+
+DECLARE @DateFrom DATE = CONVERT(DATE, @StartDate);
+DECLARE @DateToExclusive DATETIME = DATEADD(DAY, 1, CONVERT(DATE, @EndDate));
+DECLARE @MaxBOMLevel INT = 50;
+DECLARE @Epsilon DECIMAL(38,10) = 0.0000001;
+
+DROP TABLE IF EXISTS #RelevantProductionOrder;
+DROP TABLE IF EXISTS #LastOperation;
+DROP TABLE IF EXISTS #SelectedOrder;
+DROP TABLE IF EXISTS #OpenProductionSupply;
+DROP TABLE IF EXISTS #InventorySupply;
+DROP TABLE IF EXISTS #OpenPurchaseSupply;
+DROP TABLE IF EXISTS #LoadedBOM;
+DROP TABLE IF EXISTS #BOMItemSource;
+DROP TABLE IF EXISTS #NewPart;
+DROP TABLE IF EXISTS #Demand;
+DROP TABLE IF EXISTS #AllocatedSupply;
+DROP TABLE IF EXISTS #Result;
+
+/* فقط سفارش‌های جاری محصول و نیمه‌ساخته برای محاسبه آخرین عملیات و منبع تولید باز */
+SELECT
+    po.ProductionOrderID,
+    po.Number,
+    po.PartRef,
+    po.BOMRef,
+    CAST(ISNULL(po.Quantity,0) AS DECIMAL(38,10)) AS Quantity,
+    po.[State],
+    po.[Date]
+INTO #RelevantProductionOrder
+FROM PAC3.ProductionOrder AS po
+INNER JOIN LGS3.Part AS p
+    ON p.PartID = po.PartRef
+WHERE po.[State] IN (1,2,3,4)
+  AND p.PartNature IN (2,3)
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_RPO_ID
+    ON #RelevantProductionOrder(ProductionOrderID);
+CREATE INDEX IX_RPO_Part
+    ON #RelevantProductionOrder(PartRef)
+    INCLUDE (Quantity,[State],[Date],BOMRef,Number);
+
+/* آخرین عملیات مسیر اصلی، فقط برای سفارش‌های مرتبط */
+;WITH RelevantOperation AS
+(
+    SELECT
+        pos.ProductionOrderRef,
+        poo.ProductionOrderOperationID,
+        poo.Title AS OperationTitle,
+        poo.[Rank] AS OperationRank,
+        poo.[State] AS OperationState,
+        pos.ProductionOrderSequenceType,
+        pos.BranchProductionOrderOperationUniqueID,
+        pos.ReturnProductionOrderOperationUniqueID
+    FROM #RelevantProductionOrder AS rpo
+    INNER JOIN PAC3.ProductionOrderSequence AS pos
+        ON pos.ProductionOrderRef = rpo.ProductionOrderID
+    INNER JOIN PAC3.ProductionOrderOperation AS poo
+        ON poo.ProductionOrderSequenceRef = pos.ProductionOrderSequenceID
+),
+ApprovedConfirmation AS
+(
+    SELECT
+        c.ProductionOrderOperationRef,
+        CAST(SUM(ISNULL(c.Yield,0)) AS DECIMAL(38,10)) AS ApprovedProducedQty
+    FROM PAC3.Confirmation AS c
+    INNER JOIN RelevantOperation AS ro
+        ON ro.ProductionOrderOperationID = c.ProductionOrderOperationRef
+    WHERE c.[State] = 2
+    GROUP BY c.ProductionOrderOperationRef
+),
+RankedOperation AS
+(
+    SELECT
+        ro.ProductionOrderRef,
+        ro.ProductionOrderOperationID,
+        ro.OperationTitle,
+        ro.OperationRank,
+        ro.OperationState,
+        CAST(ISNULL(ac.ApprovedProducedQty,0) AS DECIMAL(38,10)) AS ApprovedProducedQty,
+        ro.ProductionOrderSequenceType,
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY ro.ProductionOrderRef
+            ORDER BY
+                CASE WHEN ro.BranchProductionOrderOperationUniqueID IS NULL
+                       AND ro.ReturnProductionOrderOperationUniqueID IS NULL THEN 0 ELSE 1 END,
+                ISNULL(ro.OperationRank,-2147483648) DESC,
+                ro.ProductionOrderOperationID DESC
+        ) AS rn
+    FROM RelevantOperation AS ro
+    LEFT JOIN ApprovedConfirmation AS ac
+        ON ac.ProductionOrderOperationRef = ro.ProductionOrderOperationID
+)
+SELECT
+    ProductionOrderRef,
+    ProductionOrderOperationID,
+    OperationTitle,
+    OperationRank,
+    OperationState,
+    ApprovedProducedQty,
+    ProductionOrderSequenceType
+INTO #LastOperation
+FROM RankedOperation
+WHERE rn = 1;
+
+CREATE UNIQUE CLUSTERED INDEX IX_LastOperation_Order
+    ON #LastOperation(ProductionOrderRef);
+
+/* سفارش‌های مبنای گزارش: فقط محصول نهایی، با فیلتر کاملاً SARGable */
+SELECT
+    ROW_NUMBER() OVER (ORDER BY po.[Date],po.ProductionOrderID) AS OrderSortNo,
+    po.ProductionOrderID,
+    po.Number AS ProductionOrderNumber,
+    po.PartRef,
+    po.BOMRef,
+    po.Quantity AS OrderQty,
+    CAST(
+        CASE
+            WHEN lo.ProductionOrderOperationID IS NULL THEN po.Quantity
+            WHEN lo.OperationState IN (1,2) THEN po.Quantity
+            WHEN lo.OperationState = 3 THEN
+                CASE WHEN po.Quantity - ISNULL(lo.ApprovedProducedQty,0) > 0
+                     THEN po.Quantity - ISNULL(lo.ApprovedProducedQty,0) ELSE 0 END
+            WHEN lo.OperationState IN (4,5,6) THEN 0
+            ELSE po.Quantity
+        END AS DECIMAL(38,10)
+    ) AS RequirementBaseQty,
+    po.[State] AS ProductionOrderState,
+    po.[Date] AS OrderDate,
+    lo.ProductionOrderOperationID AS LastOperationID,
+    lo.OperationTitle AS LastOperationTitle,
+    lo.OperationRank AS LastOperationRank,
+    lo.OperationState AS LastOperationState,
+    lo.ApprovedProducedQty AS LastOperationProducedQty
+INTO #SelectedOrder
+FROM #RelevantProductionOrder AS po
+INNER JOIN LGS3.Part AS product
+    ON product.PartID = po.PartRef
+LEFT JOIN #LastOperation AS lo
+    ON lo.ProductionOrderRef = po.ProductionOrderID
+WHERE product.PartNature = 2
+  AND (@Pro IS NULL OR po.ProductionOrderID = @Pro)
+  AND po.[Date] >= @DateFrom
+  AND po.[Date] < @DateToExclusive
+  AND
+  (
+      CASE
+          WHEN lo.ProductionOrderOperationID IS NULL THEN po.Quantity
+          WHEN lo.OperationState IN (1,2) THEN po.Quantity
+          WHEN lo.OperationState = 3 THEN
+              CASE WHEN po.Quantity - ISNULL(lo.ApprovedProducedQty,0) > 0
+                   THEN po.Quantity - ISNULL(lo.ApprovedProducedQty,0) ELSE 0 END
+          WHEN lo.OperationState IN (4,5,6) THEN 0
+          ELSE po.Quantity
+      END
+  ) > 0
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_SelectedOrder_ID
+    ON #SelectedOrder(ProductionOrderID);
+CREATE INDEX IX_SelectedOrder_Queue
+    ON #SelectedOrder(OrderSortNo)
+    INCLUDE (PartRef,BOMRef,RequirementBaseQty,OrderDate,ProductionOrderNumber,OrderQty,ProductionOrderState,LastOperationState,LastOperationTitle);
+
+/* سفارش تولید باز، یک بار به تفکیک کالا؛ سفارش‌های مبنای گزارش منبع خودشان نیستند */
+SELECT
+    po.PartRef,
+    CAST(SUM(calc.OpenQty) AS DECIMAL(38,10)) AS OpenProductionQty
+INTO #OpenProductionSupply
+FROM #RelevantProductionOrder AS po
+LEFT JOIN #LastOperation AS lo
+    ON lo.ProductionOrderRef = po.ProductionOrderID
+CROSS APPLY
+(
+    SELECT CAST(
+        CASE
+            WHEN lo.ProductionOrderOperationID IS NULL THEN po.Quantity
+            WHEN lo.OperationState IN (1,2) THEN po.Quantity
+            WHEN lo.OperationState = 3 THEN
+                CASE WHEN po.Quantity - ISNULL(lo.ApprovedProducedQty,0) > 0
+                     THEN po.Quantity - ISNULL(lo.ApprovedProducedQty,0) ELSE 0 END
+            WHEN lo.OperationState IN (4,5,6) THEN 0
+            ELSE po.Quantity
+        END AS DECIMAL(38,10)
+    ) AS OpenQty
+) AS calc
+WHERE calc.OpenQty > 0
+  AND NOT EXISTS
+  (
+      SELECT 1
+      FROM #SelectedOrder AS so
+      WHERE so.ProductionOrderID = po.ProductionOrderID
+  )
+GROUP BY po.PartRef;
+
+CREATE UNIQUE CLUSTERED INDEX IX_OpenProduction_Part
+    ON #OpenProductionSupply(PartRef);
+
+/* منابع موجودی و خرید به‌صورت Cache و فقط برای کالاهای واقعاً واردشده به BOM */
+CREATE TABLE #InventorySupply
+(
+    PartRef BIGINT NOT NULL PRIMARY KEY CLUSTERED,
+    InventoryQty DECIMAL(38,10) NOT NULL
+);
+CREATE TABLE #OpenPurchaseSupply
+(
+    PartRef BIGINT NOT NULL PRIMARY KEY CLUSTERED,
+    OpenPurchaseQty DECIMAL(38,10) NOT NULL
+);
+CREATE TABLE #LoadedBOM
+(
+    BOMRef BIGINT NOT NULL PRIMARY KEY CLUSTERED
+);
+CREATE TABLE #BOMItemSource
+(
+    BOMItemID BIGINT NOT NULL,
+    BOMRef BIGINT NOT NULL,
+    PartRef BIGINT NOT NULL,
+    PartNature INT NULL,
+    ConsumptionQty DECIMAL(38,10) NOT NULL,
+    RawGroupRef BIGINT NULL,
+    CalculationGroupKey BIGINT NOT NULL,
+    SubstitutePriority INT NOT NULL,
+    IsSubstituteGroup BIT NOT NULL
+);
+CREATE INDEX IX_BOMItemSource_Process
+    ON #BOMItemSource(BOMRef,CalculationGroupKey,SubstitutePriority,BOMItemID)
+    INCLUDE (PartRef,PartNature,ConsumptionQty,RawGroupRef,IsSubstituteGroup);
+CREATE TABLE #NewPart
+(
+    PartRef BIGINT NOT NULL PRIMARY KEY CLUSTERED
+);
+
+CREATE TABLE #Demand
+(
+    DemandID BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY CLUSTERED,
+    BOMLevel INT NOT NULL,
+    RootProductionOrderRef BIGINT NOT NULL,
+    RootOrderSortNo BIGINT NOT NULL,
+    RootPartRef BIGINT NOT NULL,
+    RootOrderDate DATE NOT NULL,
+    ParentPartRef BIGINT NOT NULL,
+    ParentBOMRef BIGINT NOT NULL,
+    ParentRequirementQty DECIMAL(38,10) NOT NULL,
+    BOMPath NVARCHAR(MAX) NOT NULL,
+    IsProcessed BIT NOT NULL DEFAULT 0
+);
+CREATE INDEX IX_Demand_Queue
+    ON #Demand(IsProcessed,RootOrderSortNo,BOMLevel,DemandID)
+    INCLUDE (RootProductionOrderRef,RootPartRef,RootOrderDate,ParentPartRef,ParentBOMRef,ParentRequirementQty);
+
+CREATE TABLE #AllocatedSupply
+(
+    PartRef BIGINT NOT NULL PRIMARY KEY CLUSTERED,
+    AllocatedInventoryQty DECIMAL(38,10) NOT NULL DEFAULT 0,
+    AllocatedOpenProductionQty DECIMAL(38,10) NOT NULL DEFAULT 0,
+    AllocatedOpenPurchaseQty DECIMAL(38,10) NOT NULL DEFAULT 0
+);
+
+CREATE TABLE #Result
+(
+    ResultID BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY CLUSTERED,
+    DemandRef BIGINT NOT NULL,
+    GroupProcessSort BIGINT NOT NULL,
+    RootProductionOrderRef BIGINT NOT NULL,
+    RootOrderSortNo BIGINT NOT NULL,
+    RootPartRef BIGINT NOT NULL,
+    BOMLevel INT NOT NULL,
+    ParentPartRef BIGINT NOT NULL,
+    ParentBOMRef BIGINT NOT NULL,
+    BOMItemID BIGINT NOT NULL,
+    RawGroupRef BIGINT NULL,
+    CalculationGroupKey BIGINT NOT NULL,
+    IsSubstituteGroup BIT NOT NULL,
+    SubstitutePriority INT NOT NULL,
+    PartRef BIGINT NOT NULL,
+    PartNature INT NULL,
+    ConsumptionQty DECIMAL(38,10) NOT NULL,
+    EquivalentMemberRequirementQty DECIMAL(38,10) NOT NULL,
+    InventorySnapshotQty DECIMAL(38,10) NOT NULL,
+    OpenProductionSnapshotQty DECIMAL(38,10) NOT NULL,
+    OpenPurchaseSnapshotQty DECIMAL(38,10) NOT NULL,
+    InventoryConsumedQty DECIMAL(38,10) NOT NULL DEFAULT 0,
+    OpenProductionConsumedQty DECIMAL(38,10) NOT NULL DEFAULT 0,
+    OpenPurchaseConsumedQty DECIMAL(38,10) NOT NULL DEFAULT 0,
+    FinalShortageQty DECIMAL(38,10) NOT NULL DEFAULT 0,
+    MemberStatus NVARCHAR(150) NULL,
+    BOMPath NVARCHAR(MAX) NOT NULL
+);
+CREATE INDEX IX_Result_Update
+    ON #Result(DemandRef,CalculationGroupKey,BOMItemID)
+    INCLUDE (InventoryConsumedQty,OpenProductionConsumedQty,OpenPurchaseConsumedQty,FinalShortageQty,MemberStatus);
+CREATE INDEX IX_Result_Final
+    ON #Result(RootOrderSortNo,BOMLevel,DemandRef,GroupProcessSort,SubstitutePriority,PartRef);
+
+INSERT INTO #Demand
+(
+    BOMLevel,RootProductionOrderRef,RootOrderSortNo,RootPartRef,RootOrderDate,
+    ParentPartRef,ParentBOMRef,ParentRequirementQty,BOMPath
+)
+SELECT
+    1,so.ProductionOrderID,so.OrderSortNo,so.PartRef,CONVERT(DATE,so.OrderDate),
+    so.PartRef,so.BOMRef,so.RequirementBaseQty,
+    N'/ROOT:' + CONVERT(NVARCHAR(30),so.ProductionOrderID)
+      + N'/BOM:' + CONVERT(NVARCHAR(30),so.BOMRef) + N'/'
+FROM #SelectedOrder AS so
+WHERE so.BOMRef IS NOT NULL
+  AND so.RequirementBaseQty > 0;
+
+DECLARE
+    @DemandID BIGINT,
+    @BOMLevel INT,
+    @RootOrderRef BIGINT,
+    @RootOrderSortNo BIGINT,
+    @RootPartRef BIGINT,
+    @RootOrderDate DATE,
+    @ParentPartRef BIGINT,
+    @ParentBOMRef BIGINT,
+    @ParentRequirementQty DECIMAL(38,10),
+    @BOMPath NVARCHAR(MAX);
+
+WHILE EXISTS
+(
+    SELECT 1 FROM #Demand
+    WHERE IsProcessed = 0 AND BOMLevel <= @MaxBOMLevel
+)
+BEGIN
+    SELECT TOP (1)
+        @DemandID = DemandID,
+        @BOMLevel = BOMLevel,
+        @RootOrderRef = RootProductionOrderRef,
+        @RootOrderSortNo = RootOrderSortNo,
+        @RootPartRef = RootPartRef,
+        @RootOrderDate = RootOrderDate,
+        @ParentPartRef = ParentPartRef,
+        @ParentBOMRef = ParentBOMRef,
+        @ParentRequirementQty = ParentRequirementQty,
+        @BOMPath = BOMPath
+    FROM #Demand
+    WHERE IsProcessed = 0 AND BOMLevel <= @MaxBOMLevel
+    ORDER BY RootOrderSortNo,BOMLevel,DemandID;
+
+    UPDATE #Demand SET IsProcessed = 1 WHERE DemandID = @DemandID;
+
+    /* هر BOM فقط در اولین استفاده خوانده می‌شود */
+    IF NOT EXISTS (SELECT 1 FROM #LoadedBOM WHERE BOMRef = @ParentBOMRef)
+    BEGIN
+        INSERT INTO #BOMItemSource
+        (
+            BOMItemID,BOMRef,PartRef,PartNature,ConsumptionQty,RawGroupRef,
+            CalculationGroupKey,SubstitutePriority,IsSubstituteGroup
+        )
+        SELECT
+            bi.BomItemID,
+            bi.BomRef,
+            bi.PartRef,
+            p.PartNature,
+            CONVERT(DECIMAL(38,10),ISNULL(bi.Quantity,0) /
+                NULLIF(CONVERT(DECIMAL(38,10),b.BaseQuantity),0)),
+            NULLIF(CONVERT(BIGINT,bi.GroupNumber),0),
+            CASE WHEN NULLIF(CONVERT(BIGINT,bi.GroupNumber),0) IS NULL
+                 THEN -CONVERT(BIGINT,bi.BomItemID)
+                 ELSE CONVERT(BIGINT,bi.GroupNumber) END,
+            CASE WHEN NULLIF(CONVERT(BIGINT,bi.GroupNumber),0) IS NULL
+                 THEN 1 ELSE ISNULL(CONVERT(INT,bi.Priority),1) END,
+            CASE WHEN NULLIF(CONVERT(BIGINT,bi.GroupNumber),0) IS NULL
+                 THEN 0 ELSE 1 END
+        FROM PAC3.BomItem AS bi
+        INNER JOIN PAC3.Bom AS b
+            ON b.BomID = bi.BomRef
+        INNER JOIN LGS3.Part AS p
+            ON p.PartID = bi.PartRef
+        WHERE bi.BomRef = @ParentBOMRef
+          AND ISNULL(bi.Quantity,0) > 0
+          AND ISNULL(b.BaseQuantity,0) > 0;
+
+        INSERT INTO #LoadedBOM(BOMRef) VALUES(@ParentBOMRef);
+    END;
+
+    /* فقط کالاهای جدید این BOM برای منابع خوانده می‌شوند */
+    TRUNCATE TABLE #NewPart;
+    INSERT INTO #NewPart(PartRef)
+    SELECT DISTINCT bis.PartRef
+    FROM #BOMItemSource AS bis
+    WHERE bis.BOMRef = @ParentBOMRef
+      AND NOT EXISTS
+      (
+          SELECT 1 FROM #InventorySupply AS inv
+          WHERE inv.PartRef = bis.PartRef
+      );
+
+    IF EXISTS (SELECT 1 FROM #NewPart)
+    BEGIN
+        INSERT INTO #InventorySupply(PartRef,InventoryQty)
+        SELECT
+            np.PartRef,
+            CAST(ISNULL(SUM(ISNULL(c.XValue,0)),0) AS DECIMAL(38,10))
+        FROM #NewPart AS np
+        LEFT JOIN LGS3.vwCardexPart AS c
+            ON c.PartRef = np.PartRef
+           AND c.TypeOfEffectOnStock = 1
+        GROUP BY np.PartRef
+        OPTION (RECOMPILE);
+
+        /* سفارش خرید در راه = سفارش خرید منهای رسید دائم انبار، بر مبنای درخواست خرید */
+        ;WITH OrderedByRequestItem AS
+        (
+            SELECT
+                pri.PurchaseRequestItemID,
+                pi.PartRef,
+                CAST(SUM(ISNULL(oi.Quantity,0)) AS DECIMAL(38,10)) AS OrderedQty
+            FROM #NewPart AS np
+            INNER JOIN PRC3.PurchaseItem AS pi
+                ON pi.PartRef = np.PartRef
+            INNER JOIN PRC3.PurchaseRequestItem AS pri
+                ON pri.PurchaseItemRef = pi.PurchaseItemID
+            INNER JOIN PRC3.OrderItem AS oi
+                ON oi.PurchaseRequestItemRef = pri.PurchaseRequestItemID
+            INNER JOIN PRC3.[Order] AS oh
+                ON oh.OrderID = oi.OrderRef
+            GROUP BY pri.PurchaseRequestItemID,pi.PartRef
+        ),
+        PermanentReceiptByRequestItem AS
+        (
+            SELECT
+                ord.PurchaseRequestItemID,
+                CAST(SUM(ISNULL(permanentIvi.Quantity,0)) AS DECIMAL(38,10)) AS PermanentReceiptQty
+            FROM OrderedByRequestItem AS ord
+            INNER JOIN PRC3.DeliveryItem AS di
+                ON di.PurchaseRequestItemRef = ord.PurchaseRequestItemID
+            INNER JOIN LGS3.ReceiptPermitItem AS rpi
+                ON rpi.ReferenceRef = di.DeliveryItemID
+               AND rpi.ReferenceType = 4
+            INNER JOIN LGS3.InventoryVoucherItem AS temporaryIvi
+                ON temporaryIvi.ReferenceRef = rpi.ReceiptPermitItemID
+               AND temporaryIvi.ReferenceType = 2
+            INNER JOIN LGS3.InventoryVoucherItem AS permanentIvi
+                ON permanentIvi.ReferenceRef = temporaryIvi.InventoryVoucherItemID
+               AND permanentIvi.InventoryVoucherSpecificationRef IN (10005,10046)
+            GROUP BY ord.PurchaseRequestItemID
+        ),
+        OpenByPart AS
+        (
+            SELECT
+                ord.PartRef,
+                CAST(
+                    CASE WHEN ord.OrderedQty - ISNULL(rec.PermanentReceiptQty,0) > 0
+                         THEN ord.OrderedQty - ISNULL(rec.PermanentReceiptQty,0)
+                         ELSE 0 END AS DECIMAL(38,10)
+                ) AS OpenQty
+            FROM OrderedByRequestItem AS ord
+            LEFT JOIN PermanentReceiptByRequestItem AS rec
+                ON rec.PurchaseRequestItemID = ord.PurchaseRequestItemID
+        )
+        INSERT INTO #OpenPurchaseSupply(PartRef,OpenPurchaseQty)
+        SELECT
+            np.PartRef,
+            CAST(ISNULL(SUM(op.OpenQty),0) AS DECIMAL(38,10))
+        FROM #NewPart AS np
+        LEFT JOIN OpenByPart AS op
+            ON op.PartRef = np.PartRef
+        GROUP BY np.PartRef
+        OPTION (RECOMPILE);
+
+        INSERT INTO #AllocatedSupply
+        (
+            PartRef,AllocatedInventoryQty,AllocatedOpenProductionQty,AllocatedOpenPurchaseQty
+        )
+        SELECT np.PartRef,0,0,0
+        FROM #NewPart AS np
+        WHERE NOT EXISTS
+        (
+            SELECT 1 FROM #AllocatedSupply AS a WHERE a.PartRef = np.PartRef
+        );
+    END;
+
+    DECLARE @GroupKey BIGINT,@GroupProcessSort BIGINT;
+    DECLARE GroupCursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT CalculationGroupKey,MIN(BOMItemID)
+        FROM #BOMItemSource
+        WHERE BOMRef = @ParentBOMRef
+        GROUP BY CalculationGroupKey
+        ORDER BY MIN(BOMItemID);
+
+    OPEN GroupCursor;
+    FETCH NEXT FROM GroupCursor INTO @GroupKey,@GroupProcessSort;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        DECLARE
+            @FirstBOMItemID BIGINT,
+            @FirstPartRef BIGINT,
+            @FirstPartNature INT,
+            @FirstConsumptionQty DECIMAL(38,10),
+            @RemainingCoverageQty DECIMAL(38,10);
+
+        SELECT TOP (1)
+            @FirstBOMItemID = BOMItemID,
+            @FirstPartRef = PartRef,
+            @FirstPartNature = PartNature,
+            @FirstConsumptionQty = ConsumptionQty
+        FROM #BOMItemSource
+        WHERE BOMRef = @ParentBOMRef
+          AND CalculationGroupKey = @GroupKey
+        ORDER BY SubstitutePriority,BOMItemID;
+
+        SET @RemainingCoverageQty = @ParentRequirementQty;
+
+        INSERT INTO #Result
+        (
+            DemandRef,GroupProcessSort,RootProductionOrderRef,RootOrderSortNo,RootPartRef,
+            BOMLevel,ParentPartRef,ParentBOMRef,BOMItemID,RawGroupRef,CalculationGroupKey,
+            IsSubstituteGroup,SubstitutePriority,PartRef,PartNature,ConsumptionQty,
+            EquivalentMemberRequirementQty,InventorySnapshotQty,OpenProductionSnapshotQty,
+            OpenPurchaseSnapshotQty,BOMPath,MemberStatus
+        )
+        SELECT
+            @DemandID,@GroupProcessSort,@RootOrderRef,@RootOrderSortNo,@RootPartRef,
+            @BOMLevel,@ParentPartRef,@ParentBOMRef,bis.BOMItemID,bis.RawGroupRef,
+            bis.CalculationGroupKey,bis.IsSubstituteGroup,bis.SubstitutePriority,bis.PartRef,
+            bis.PartNature,bis.ConsumptionQty,
+            CAST(@ParentRequirementQty * bis.ConsumptionQty AS DECIMAL(38,10)),
+            ISNULL(inv.InventoryQty,0),
+            ISNULL(ops.OpenProductionQty,0),
+            ISNULL(pur.OpenPurchaseQty,0),
+            @BOMPath,N'بررسی نشده'
+        FROM #BOMItemSource AS bis
+        LEFT JOIN #InventorySupply AS inv
+            ON inv.PartRef = bis.PartRef
+        LEFT JOIN #OpenProductionSupply AS ops
+            ON ops.PartRef = bis.PartRef
+        LEFT JOIN #OpenPurchaseSupply AS pur
+            ON pur.PartRef = bis.PartRef
+        WHERE bis.BOMRef = @ParentBOMRef
+          AND bis.CalculationGroupKey = @GroupKey;
+
+        DECLARE
+            @MemberBOMItemID BIGINT,
+            @MemberPartRef BIGINT,
+            @MemberConsumptionQty DECIMAL(38,10),
+            @AvailableItemQty DECIMAL(38,10),
+            @CoverageQty DECIMAL(38,10),
+            @ConsumedCoverageQty DECIMAL(38,10),
+            @ConsumedItemQty DECIMAL(38,10);
+
+        /* مرحله 1: موجودی تمام اعضا به ترتیب اولویت */
+        DECLARE InventoryCursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT
+                bis.BOMItemID,bis.PartRef,bis.ConsumptionQty,
+                CASE WHEN ISNULL(inv.InventoryQty,0) - ISNULL(a.AllocatedInventoryQty,0) > 0
+                     THEN ISNULL(inv.InventoryQty,0) - ISNULL(a.AllocatedInventoryQty,0) ELSE 0 END
+            FROM #BOMItemSource AS bis
+            LEFT JOIN #InventorySupply AS inv ON inv.PartRef = bis.PartRef
+            LEFT JOIN #AllocatedSupply AS a ON a.PartRef = bis.PartRef
+            WHERE bis.BOMRef = @ParentBOMRef
+              AND bis.CalculationGroupKey = @GroupKey
+            ORDER BY bis.SubstitutePriority,bis.BOMItemID;
+
+        OPEN InventoryCursor;
+        FETCH NEXT FROM InventoryCursor INTO @MemberBOMItemID,@MemberPartRef,@MemberConsumptionQty,@AvailableItemQty;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            IF @RemainingCoverageQty > @Epsilon
+               AND @MemberConsumptionQty > 0
+               AND @AvailableItemQty > @Epsilon
+            BEGIN
+                SET @CoverageQty = @AvailableItemQty / @MemberConsumptionQty;
+                SET @ConsumedCoverageQty = CASE WHEN @CoverageQty < @RemainingCoverageQty
+                                                THEN @CoverageQty ELSE @RemainingCoverageQty END;
+                SET @ConsumedItemQty = @ConsumedCoverageQty * @MemberConsumptionQty;
+
+                UPDATE #Result
+                SET InventoryConsumedQty = InventoryConsumedQty + @ConsumedItemQty,
+                    MemberStatus = N'تامین از موجودی'
+                WHERE DemandRef = @DemandID
+                  AND CalculationGroupKey = @GroupKey
+                  AND BOMItemID = @MemberBOMItemID;
+
+                UPDATE #AllocatedSupply
+                SET AllocatedInventoryQty = AllocatedInventoryQty + @ConsumedItemQty
+                WHERE PartRef = @MemberPartRef;
+
+                SET @RemainingCoverageQty = CASE
+                    WHEN ABS(@RemainingCoverageQty - @ConsumedCoverageQty) < @Epsilon THEN 0
+                    ELSE @RemainingCoverageQty - @ConsumedCoverageQty END;
+            END;
+            FETCH NEXT FROM InventoryCursor INTO @MemberBOMItemID,@MemberPartRef,@MemberConsumptionQty,@AvailableItemQty;
+        END;
+        CLOSE InventoryCursor;
+        DEALLOCATE InventoryCursor;
+
+        /* مرحله 2: سفارش تولید باز تمام اعضا به ترتیب اولویت */
+        IF @RemainingCoverageQty > @Epsilon
+        BEGIN
+            DECLARE OpenProductionCursor CURSOR LOCAL FAST_FORWARD FOR
+                SELECT
+                    bis.BOMItemID,bis.PartRef,bis.ConsumptionQty,
+                    CASE WHEN ISNULL(ops.OpenProductionQty,0) - ISNULL(a.AllocatedOpenProductionQty,0) > 0
+                         THEN ISNULL(ops.OpenProductionQty,0) - ISNULL(a.AllocatedOpenProductionQty,0) ELSE 0 END
+                FROM #BOMItemSource AS bis
+                LEFT JOIN #OpenProductionSupply AS ops ON ops.PartRef = bis.PartRef
+                LEFT JOIN #AllocatedSupply AS a ON a.PartRef = bis.PartRef
+                WHERE bis.BOMRef = @ParentBOMRef
+                  AND bis.CalculationGroupKey = @GroupKey
+                ORDER BY bis.SubstitutePriority,bis.BOMItemID;
+
+            OPEN OpenProductionCursor;
+            FETCH NEXT FROM OpenProductionCursor INTO @MemberBOMItemID,@MemberPartRef,@MemberConsumptionQty,@AvailableItemQty;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                IF @RemainingCoverageQty > @Epsilon
+                   AND @MemberConsumptionQty > 0
+                   AND @AvailableItemQty > @Epsilon
+                BEGIN
+                    SET @CoverageQty = @AvailableItemQty / @MemberConsumptionQty;
+                    SET @ConsumedCoverageQty = CASE WHEN @CoverageQty < @RemainingCoverageQty
+                                                    THEN @CoverageQty ELSE @RemainingCoverageQty END;
+                    SET @ConsumedItemQty = @ConsumedCoverageQty * @MemberConsumptionQty;
+
+                    UPDATE #Result
+                    SET OpenProductionConsumedQty = OpenProductionConsumedQty + @ConsumedItemQty,
+                        MemberStatus = CASE WHEN InventoryConsumedQty > @Epsilon
+                                            THEN N'تامین از موجودی و سفارش تولید باز'
+                                            ELSE N'تامین از سفارش تولید باز' END
+                    WHERE DemandRef = @DemandID
+                      AND CalculationGroupKey = @GroupKey
+                      AND BOMItemID = @MemberBOMItemID;
+
+                    UPDATE #AllocatedSupply
+                    SET AllocatedOpenProductionQty = AllocatedOpenProductionQty + @ConsumedItemQty
+                    WHERE PartRef = @MemberPartRef;
+
+                    SET @RemainingCoverageQty = CASE
+                        WHEN ABS(@RemainingCoverageQty - @ConsumedCoverageQty) < @Epsilon THEN 0
+                        ELSE @RemainingCoverageQty - @ConsumedCoverageQty END;
+                END;
+                FETCH NEXT FROM OpenProductionCursor INTO @MemberBOMItemID,@MemberPartRef,@MemberConsumptionQty,@AvailableItemQty;
+            END;
+            CLOSE OpenProductionCursor;
+            DEALLOCATE OpenProductionCursor;
+        END;
+
+        /* مرحله 3: سفارش خرید در راه فقط برای مواد اولیه */
+        IF @RemainingCoverageQty > @Epsilon
+        BEGIN
+            DECLARE OpenPurchaseCursor CURSOR LOCAL FAST_FORWARD FOR
+                SELECT
+                    bis.BOMItemID,bis.PartRef,bis.ConsumptionQty,
+                    CASE WHEN ISNULL(pur.OpenPurchaseQty,0) - ISNULL(a.AllocatedOpenPurchaseQty,0) > 0
+                         THEN ISNULL(pur.OpenPurchaseQty,0) - ISNULL(a.AllocatedOpenPurchaseQty,0) ELSE 0 END
+                FROM #BOMItemSource AS bis
+                LEFT JOIN #OpenPurchaseSupply AS pur ON pur.PartRef = bis.PartRef
+                LEFT JOIN #AllocatedSupply AS a ON a.PartRef = bis.PartRef
+                WHERE bis.BOMRef = @ParentBOMRef
+                  AND bis.CalculationGroupKey = @GroupKey
+                  AND bis.PartNature = 1
+                ORDER BY bis.SubstitutePriority,bis.BOMItemID;
+
+            OPEN OpenPurchaseCursor;
+            FETCH NEXT FROM OpenPurchaseCursor INTO @MemberBOMItemID,@MemberPartRef,@MemberConsumptionQty,@AvailableItemQty;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                IF @RemainingCoverageQty > @Epsilon
+                   AND @MemberConsumptionQty > 0
+                   AND @AvailableItemQty > @Epsilon
+                BEGIN
+                    SET @CoverageQty = @AvailableItemQty / @MemberConsumptionQty;
+                    SET @ConsumedCoverageQty = CASE WHEN @CoverageQty < @RemainingCoverageQty
+                                                    THEN @CoverageQty ELSE @RemainingCoverageQty END;
+                    SET @ConsumedItemQty = @ConsumedCoverageQty * @MemberConsumptionQty;
+
+                    UPDATE #Result
+                    SET OpenPurchaseConsumedQty = OpenPurchaseConsumedQty + @ConsumedItemQty,
+                        MemberStatus = CASE
+                            WHEN InventoryConsumedQty > @Epsilon AND OpenProductionConsumedQty > @Epsilon
+                                THEN N'تامین از موجودی، سفارش تولید باز و سفارش خرید در راه'
+                            WHEN InventoryConsumedQty > @Epsilon
+                                THEN N'تامین از موجودی و سفارش خرید در راه'
+                            WHEN OpenProductionConsumedQty > @Epsilon
+                                THEN N'تامین از سفارش تولید باز و سفارش خرید در راه'
+                            ELSE N'تامین از سفارش خرید در راه' END
+                    WHERE DemandRef = @DemandID
+                      AND CalculationGroupKey = @GroupKey
+                      AND BOMItemID = @MemberBOMItemID;
+
+                    UPDATE #AllocatedSupply
+                    SET AllocatedOpenPurchaseQty = AllocatedOpenPurchaseQty + @ConsumedItemQty
+                    WHERE PartRef = @MemberPartRef;
+
+                    SET @RemainingCoverageQty = CASE
+                        WHEN ABS(@RemainingCoverageQty - @ConsumedCoverageQty) < @Epsilon THEN 0
+                        ELSE @RemainingCoverageQty - @ConsumedCoverageQty END;
+                END;
+                FETCH NEXT FROM OpenPurchaseCursor INTO @MemberBOMItemID,@MemberPartRef,@MemberConsumptionQty,@AvailableItemQty;
+            END;
+            CLOSE OpenPurchaseCursor;
+            DEALLOCATE OpenPurchaseCursor;
+        END;
+
+        /* کسری فقط روی عضو اولویت 1 */
+        IF @RemainingCoverageQty > @Epsilon AND @FirstBOMItemID IS NOT NULL
+        BEGIN
+            DECLARE @RequiredFirstItemQty DECIMAL(38,10) =
+                @RemainingCoverageQty * @FirstConsumptionQty;
+
+            UPDATE #Result
+            SET FinalShortageQty = @RequiredFirstItemQty,
+                MemberStatus = CASE
+                    WHEN @FirstPartNature = 1 THEN N'منتخب اولویت 1 برای خرید'
+                    WHEN @FirstPartNature IN (2,3) THEN N'منتخب اولویت 1 برای سفارش تولید'
+                    ELSE N'منتخب اولویت 1 با ماهیت نامشخص' END
+            WHERE DemandRef = @DemandID
+              AND CalculationGroupKey = @GroupKey
+              AND BOMItemID = @FirstBOMItemID;
+
+            /* فقط نیمه‌ساخته اولویت 1 و فقط به اندازه کسری منفجر می‌شود */
+            IF @FirstPartNature = 3 AND @BOMLevel < @MaxBOMLevel
+            BEGIN
+                DECLARE @ChildBOMRef BIGINT = NULL,@EdgeToken NVARCHAR(100);
+
+                SELECT TOP (1) @ChildBOMRef = b.BomID
+                FROM PAC3.Bom AS b
+                WHERE b.PartRef = @FirstPartRef
+                  AND ISNULL(b.BaseQuantity,0) > 0
+                ORDER BY
+                    CASE
+                        WHEN b.StartValidityDate < DATEADD(DAY,1,@RootOrderDate)
+                         AND (b.EndValidityDate IS NULL OR b.EndValidityDate >= @RootOrderDate)
+                         AND (b.FromLotSize IS NULL OR @RequiredFirstItemQty >= b.FromLotSize)
+                         AND (b.ToLotSize IS NULL OR @RequiredFirstItemQty <= b.ToLotSize) THEN 0
+                        WHEN b.StartValidityDate < DATEADD(DAY,1,@RootOrderDate)
+                         AND (b.EndValidityDate IS NULL OR b.EndValidityDate >= @RootOrderDate) THEN 1
+                        ELSE 2
+                    END,
+                    b.StartValidityDate DESC,
+                    b.BomID DESC;
+
+                IF @ChildBOMRef IS NOT NULL
+                BEGIN
+                    SET @EdgeToken = N'EDGE:' + CONVERT(NVARCHAR(30),@ParentBOMRef)
+                        + N':' + CONVERT(NVARCHAR(30),@FirstBOMItemID) + N'/';
+
+                    IF CHARINDEX(N'/' + @EdgeToken,@BOMPath) = 0
+                    BEGIN
+                        INSERT INTO #Demand
+                        (
+                            BOMLevel,RootProductionOrderRef,RootOrderSortNo,RootPartRef,RootOrderDate,
+                            ParentPartRef,ParentBOMRef,ParentRequirementQty,BOMPath
+                        )
+                        VALUES
+                        (
+                            @BOMLevel + 1,@RootOrderRef,@RootOrderSortNo,@RootPartRef,@RootOrderDate,
+                            @FirstPartRef,@ChildBOMRef,@RequiredFirstItemQty,
+                            @BOMPath + @EdgeToken + N'BOM:' + CONVERT(NVARCHAR(30),@ChildBOMRef) + N'/'
+                        );
+                    END;
+                END;
+            END;
+        END;
+
+        FETCH NEXT FROM GroupCursor INTO @GroupKey,@GroupProcessSort;
+    END;
+
+    CLOSE GroupCursor;
+    DEALLOCATE GroupCursor;
+END;
+
+;WITH AggregatedResult AS
+(
+    SELECT
+        r.RootProductionOrderRef,
+        r.RootOrderSortNo,
+        r.RootPartRef,
+        r.BOMLevel,
+        r.PartRef,
+        r.PartNature,
+        r.IsSubstituteGroup,
+        r.RawGroupRef,
+        r.SubstitutePriority,
+        r.DemandRef AS FirstDemandRef,
+        r.GroupProcessSort AS FirstGroupProcessSort,
+        r.CalculationGroupKey,
+        r.BOMPath,
+        SUM(r.EquivalentMemberRequirementQty) AS EquivalentMemberRequirementQty,
+        MAX(r.InventorySnapshotQty) AS InventorySnapshotQty,
+        MAX(r.OpenProductionSnapshotQty) AS OpenProductionSnapshotQty,
+        MAX(r.OpenPurchaseSnapshotQty) AS OpenPurchaseSnapshotQty,
+        SUM(r.InventoryConsumedQty) AS InventoryConsumedQty,
+        SUM(r.OpenProductionConsumedQty) AS OpenProductionConsumedQty,
+        SUM(r.OpenPurchaseConsumedQty) AS OpenPurchaseConsumedQty,
+        SUM(r.FinalShortageQty) AS FinalShortageQty
+    FROM #Result AS r
+    GROUP BY
+        r.RootProductionOrderRef,r.RootOrderSortNo,r.RootPartRef,r.BOMLevel,r.PartRef,r.PartNature,
+        r.IsSubstituteGroup,r.RawGroupRef,r.SubstitutePriority,r.DemandRef,r.GroupProcessSort,
+        r.CalculationGroupKey,r.BOMPath
+),
+OrderedResult AS
+(
+    SELECT
+        ar.*,
+        ISNULL
+        (
+            SUM(ar.InventoryConsumedQty + ar.OpenProductionConsumedQty + ar.OpenPurchaseConsumedQty)
+            OVER
+            (
+                PARTITION BY ar.PartRef
+                ORDER BY ar.RootOrderSortNo,ar.BOMLevel,ar.FirstDemandRef,
+                         ar.FirstGroupProcessSort,ar.SubstitutePriority,ar.PartRef
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+            ),0
+        ) AS AllocatedBeforeDisplayQty
+    FROM AggregatedResult AS ar
+)
+SELECT
+    so.ProductionOrderNumber AS [شماره سفارش تولید],
+    SYS3.fn_DateToShamsiDate(so.OrderDate) AS [تاریخ سفارش تولید],
+    product.Code AS [کد محصول],
+    product.Name AS [نام محصول],
+    ISNULL(posl.Title,N'نامشخص') AS [وضعیت سفارش تولید],
+    ISNULL(so.LastOperationTitle,N'فاقد عملیات') + N' - ' + ISNULL(poosl.Title,N'نامشخص') AS [آخرین عملیات و وضعیت],
+    CONVERT(DECIMAL(38,3),ROUND(so.OrderQty,3)) AS [مقدار کل سفارش],
+    CONVERT(DECIMAL(38,3),ROUND(so.RequirementBaseQty,3)) AS [مقدار مبنای نیازسنجی],
+    ar.BOMLevel AS [لایه BOM],
+    p.Code AS [کد کالا],
+    p.Name AS [نام کالا],
+    ISNULL(u.Name,N'') AS [واحد سنجش],
+    CASE ar.PartNature WHEN 1 THEN N'ماده اولیه' WHEN 2 THEN N'محصول نهایی'
+         WHEN 3 THEN N'نیمه‌ساخته' ELSE N'نامشخص' END AS [ماهیت کالا],
+    CASE WHEN ar.IsSubstituteGroup = 1
+         THEN N'گروه ' + CONVERT(NVARCHAR(30),ar.RawGroupRef)
+              + N' - اولویت ' + CONVERT(NVARCHAR(20),ar.SubstitutePriority)
+         ELSE N'بدون جایگزین' END AS [گروه و اولویت جایگزینی],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.EquivalentMemberRequirementQty) < 0.0005 THEN 0 ELSE ar.EquivalentMemberRequirementQty END,3)) AS [نیاز معادل عضو],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.InventorySnapshotQty) < 0.0005 THEN 0 ELSE ar.InventorySnapshotQty END,3)) AS [موجودی انبار],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.OpenProductionSnapshotQty) < 0.0005 THEN 0 ELSE ar.OpenProductionSnapshotQty END,3)) AS [سفارش‌های تولید باز],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.OpenPurchaseSnapshotQty) < 0.0005 THEN 0 ELSE ar.OpenPurchaseSnapshotQty END,3)) AS [سفارش خرید در راه],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.InventoryConsumedQty) < 0.0005 THEN 0 ELSE ar.InventoryConsumedQty END,3)) AS [تامین از موجودی],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.OpenProductionConsumedQty) < 0.0005 THEN 0 ELSE ar.OpenProductionConsumedQty END,3)) AS [تامین از سفارش تولید باز],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.OpenPurchaseConsumedQty) < 0.0005 THEN 0 ELSE ar.OpenPurchaseConsumedQty END,3)) AS [تامین از سفارش خرید],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.AllocatedBeforeDisplayQty) < 0.0005 THEN 0 ELSE ar.AllocatedBeforeDisplayQty END,3)) AS [تخصیص تجمعی پیش از ردیف],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.InventoryConsumedQty + ar.OpenProductionConsumedQty + ar.OpenPurchaseConsumedQty) < 0.0005
+        THEN 0 ELSE ar.InventoryConsumedQty + ar.OpenProductionConsumedQty + ar.OpenPurchaseConsumedQty END,3)) AS [تخصیص جاری],
+    CONVERT(DECIMAL(38,3),ROUND(CASE WHEN ABS(ar.FinalShortageQty) < 0.0005 THEN 0 ELSE ar.FinalShortageQty END,3)) AS [کسری نهایی],
+    CASE
+        WHEN ar.FinalShortageQty >= 0.0005 AND ar.PartNature = 1
+            THEN N'خرید ' + CONVERT(NVARCHAR(50),CONVERT(DECIMAL(38,3),ar.FinalShortageQty))
+        WHEN ar.FinalShortageQty >= 0.0005 AND ar.PartNature IN (2,3)
+            THEN N'سفارش تولید ' + CONVERT(NVARCHAR(50),CONVERT(DECIMAL(38,3),ar.FinalShortageQty))
+        WHEN ar.FinalShortageQty >= 0.0005 THEN N'کنترل ماهیت و روش تامین'
+        WHEN ar.InventoryConsumedQty + ar.OpenProductionConsumedQty + ar.OpenPurchaseConsumedQty >= 0.0005
+            THEN N'تامین‌شده'
+        WHEN ar.IsSubstituteGroup = 1 THEN N'جایگزین بررسی‌شده و استفاده‌نشده'
+        ELSE N'بدون نیاز'
+    END AS [اقدام موردنیاز]
+FROM OrderedResult AS ar
+INNER JOIN #SelectedOrder AS so
+    ON so.ProductionOrderID = ar.RootProductionOrderRef
+INNER JOIN LGS3.Part AS product
+    ON product.PartID = so.PartRef
+INNER JOIN LGS3.Part AS p
+    ON p.PartID = ar.PartRef
+LEFT JOIN GNR3.Unit AS u
+    ON u.UnitID = p.MajorUnitRef
+LEFT JOIN SYS3.[Lookup] AS posl
+    ON posl.[Type] = N'ProductionOrderState' AND posl.Code = so.ProductionOrderState
+LEFT JOIN SYS3.[Lookup] AS poosl
+    ON poosl.[Type] = N'ProductionOrderOperationState' AND poosl.Code = so.LastOperationState
+ORDER BY
+    ar.RootOrderSortNo,ar.BOMLevel,ar.FirstDemandRef,ar.FirstGroupProcessSort,
+    ar.IsSubstituteGroup,ar.RawGroupRef,ar.SubstitutePriority,ar.PartRef
+OPTION (RECOMPILE);
+        ]]></CommandText>
+        <Timeout>0</Timeout>
+      </Query>
+      <Fields>
+        <Field Name="شماره_سفارش_تولید"><DataField>شماره سفارش تولید</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="تاریخ_سفارش_تولید"><DataField>تاریخ سفارش تولید</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="کد_محصول"><DataField>کد محصول</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="نام_محصول"><DataField>نام محصول</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="وضعیت_سفارش_تولید"><DataField>وضعیت سفارش تولید</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="آخرین_عملیات_و_وضعیت"><DataField>آخرین عملیات و وضعیت</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="مقدار_کل_سفارش"><DataField>مقدار کل سفارش</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="مقدار_مبنای_نیازسنجی"><DataField>مقدار مبنای نیازسنجی</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="لایه_BOM"><DataField>لایه BOM</DataField><rd:TypeName>System.Int32</rd:TypeName></Field>
+        <Field Name="کد_کالا"><DataField>کد کالا</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="نام_کالا"><DataField>نام کالا</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="واحد_سنجش"><DataField>واحد سنجش</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="ماهیت_کالا"><DataField>ماهیت کالا</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="گروه_و_اولویت_جایگزینی"><DataField>گروه و اولویت جایگزینی</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+        <Field Name="نیاز_معادل_عضو"><DataField>نیاز معادل عضو</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="موجودی_انبار"><DataField>موجودی انبار</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="سفارش_های_تولید_باز"><DataField>سفارش‌های تولید باز</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="سفارش_خرید_در_راه"><DataField>سفارش خرید در راه</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="تامین_از_موجودی"><DataField>تامین از موجودی</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="تامین_از_سفارش_تولید_باز"><DataField>تامین از سفارش تولید باز</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="تامین_از_سفارش_خرید"><DataField>تامین از سفارش خرید</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="تخصیص_تجمعی_پیش_از_ردیف"><DataField>تخصیص تجمعی پیش از ردیف</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="تخصیص_جاری"><DataField>تخصیص جاری</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="کسری_نهایی"><DataField>کسری نهایی</DataField><rd:TypeName>System.Decimal</rd:TypeName></Field>
+        <Field Name="اقدام_موردنیاز"><DataField>اقدام موردنیاز</DataField><rd:TypeName>System.String</rd:TypeName></Field>
+      </Fields>
+    </DataSet>
+  </DataSets>
+  <ReportSections>
+    <ReportSection>
+      <Body>
+        <ReportItems>
+          <Textbox Name="Title">
+            <CanGrow>true</CanGrow><KeepTogether>true</KeepTogether>
+            <Paragraphs><Paragraph><TextRuns><TextRun><Value>کنترل نیازسنجی مواد سفارش‌های تولید با احتساب جایگزینی</Value><Style><FontFamily>Tahoma</FontFamily><FontSize>14pt</FontSize><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style><TextAlign>Center</TextAlign></Style></Paragraph></Paragraphs>
+            <Top>0.1in</Top><Left>0.1in</Left><Height>0.35in</Height><Width>23.8in</Width>
+            <Style><Border><Style>None</Style></Border></Style>
+          </Textbox>
+          <Tablix Name="MainTablix">
+            <TablixBody>
+              <TablixColumns>
+                <TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>1.35in</Width></TablixColumn><TablixColumn><Width>0.95in</Width></TablixColumn><TablixColumn><Width>1.45in</Width></TablixColumn><TablixColumn><Width>0.8in</Width></TablixColumn><TablixColumn><Width>0.9in</Width></TablixColumn><TablixColumn><Width>0.6in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>1.55in</Width></TablixColumn><TablixColumn><Width>0.75in</Width></TablixColumn><TablixColumn><Width>0.8in</Width></TablixColumn><TablixColumn><Width>1.15in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>0.9in</Width></TablixColumn><TablixColumn><Width>0.9in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>0.95in</Width></TablixColumn><TablixColumn><Width>0.9in</Width></TablixColumn><TablixColumn><Width>1.0in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>0.85in</Width></TablixColumn><TablixColumn><Width>1.35in</Width></TablixColumn>
+              </TablixColumns>
+              <TablixRows>
+                <TablixRow><Height>0.42in</Height><TablixCells>
+                  <TablixCell><CellContents><Textbox Name="H01"><Paragraphs><Paragraph><TextRuns><TextRun><Value>سفارش تولید</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H02"><Paragraphs><Paragraph><TextRuns><TextRun><Value>تاریخ سفارش</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H03"><Paragraphs><Paragraph><TextRuns><TextRun><Value>کد محصول</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H04"><Paragraphs><Paragraph><TextRuns><TextRun><Value>نام محصول</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H05"><Paragraphs><Paragraph><TextRuns><TextRun><Value>وضعیت سفارش</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H06"><Paragraphs><Paragraph><TextRuns><TextRun><Value>آخرین عملیات و وضعیت</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H07"><Paragraphs><Paragraph><TextRuns><TextRun><Value>مقدار کل سفارش</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H08"><Paragraphs><Paragraph><TextRuns><TextRun><Value>مبنای نیازسنجی</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H09"><Paragraphs><Paragraph><TextRuns><TextRun><Value>لایه BOM</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H10"><Paragraphs><Paragraph><TextRuns><TextRun><Value>کد کالا</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H11"><Paragraphs><Paragraph><TextRuns><TextRun><Value>نام کالا</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H12"><Paragraphs><Paragraph><TextRuns><TextRun><Value>واحد سنجش</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H13"><Paragraphs><Paragraph><TextRuns><TextRun><Value>ماهیت</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H14"><Paragraphs><Paragraph><TextRuns><TextRun><Value>گروه و اولویت جایگزینی</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H15"><Paragraphs><Paragraph><TextRuns><TextRun><Value>نیاز معادل عضو</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H16"><Paragraphs><Paragraph><TextRuns><TextRun><Value>موجودی انبار</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H17"><Paragraphs><Paragraph><TextRuns><TextRun><Value>سفارش‌های تولید باز</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H18"><Paragraphs><Paragraph><TextRuns><TextRun><Value>سفارش خرید در راه</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H19"><Paragraphs><Paragraph><TextRuns><TextRun><Value>تامین از موجودی</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H20"><Paragraphs><Paragraph><TextRuns><TextRun><Value>تامین از سفارش تولید</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H21"><Paragraphs><Paragraph><TextRuns><TextRun><Value>تامین از سفارش خرید</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H22"><Paragraphs><Paragraph><TextRuns><TextRun><Value>تخصیص تجمعی پیش از ردیف</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H23"><Paragraphs><Paragraph><TextRuns><TextRun><Value>تخصیص جاری</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H24"><Paragraphs><Paragraph><TextRuns><TextRun><Value>کسری نهایی</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="H25"><Paragraphs><Paragraph><TextRuns><TextRun><Value>اقدام موردنیاز</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><BackgroundColor>#D9EAF7</BackgroundColor><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><FontWeight>Bold</FontWeight><TextAlign>Center</TextAlign><VerticalAlign>Middle</VerticalAlign></Style></Textbox></CellContents></TablixCell>
+                </TablixCells></TablixRow>
+                <TablixRow><Height>0.28in</Height><TablixCells>
+                  <TablixCell><CellContents><Textbox Name="D01"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!شماره_سفارش_تولید.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D02"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!تاریخ_سفارش_تولید.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D03"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!کد_محصول.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D04"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!نام_محصول.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D05"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!وضعیت_سفارش_تولید.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D06"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!آخرین_عملیات_و_وضعیت.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D07"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!مقدار_کل_سفارش.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D08"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!مقدار_مبنای_نیازسنجی.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D09"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!لایه_BOM.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D10"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!کد_کالا.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D11"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!نام_کالا.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D12"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!واحد_سنجش.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D13"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!ماهیت_کالا.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D14"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!گروه_و_اولویت_جایگزینی.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D15"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!نیاز_معادل_عضو.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D16"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!موجودی_انبار.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D17"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!سفارش_های_تولید_باز.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D18"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!سفارش_خرید_در_راه.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D19"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!تامین_از_موجودی.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D20"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!تامین_از_سفارش_تولید_باز.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D21"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!تامین_از_سفارش_خرید.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D22"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!تخصیص_تجمعی_پیش_از_ردیف.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D23"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!تخصیص_جاری.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D24"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!کسری_نهایی.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><Format>#,##0.###</Format><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                  <TablixCell><CellContents><Textbox Name="D25"><Paragraphs><Paragraph><TextRuns><TextRun><Value>=Fields!اقدام_موردنیاز.Value</Value></TextRun></TextRuns></Paragraph></Paragraphs><Style><Border><Style>Solid</Style></Border><FontFamily>Tahoma</FontFamily><FontSize>7pt</FontSize><BackgroundColor>=Switch(Fields!اقدام_موردنیاز.Value="تامین‌شده","#C6EFCE",InStr(Fields!اقدام_موردنیاز.Value,"خرید")&gt;0,"#FFF2CC",InStr(Fields!اقدام_موردنیاز.Value,"سفارش تولید")&gt;0,"#FCE4D6",True,"White")</BackgroundColor><TextAlign>Center</TextAlign></Style></Textbox></CellContents></TablixCell>
+                </TablixCells></TablixRow>
+              </TablixRows>
+            </TablixBody>
+            <TablixColumnHierarchy><TablixMembers><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/><TablixMember/></TablixMembers></TablixColumnHierarchy>
+            <TablixRowHierarchy><TablixMembers><TablixMember><KeepWithGroup>After</KeepWithGroup><RepeatOnNewPage>true</RepeatOnNewPage></TablixMember><TablixMember><Group Name="Details"/></TablixMember></TablixMembers></TablixRowHierarchy>
+            <DataSetName>DataSet1</DataSetName>
+            <Top>0.55in</Top><Left>0.1in</Left><Height>0.7in</Height><Width>23.8in</Width>
+            <Style><Direction>RTL</Direction><Border><Style>None</Style></Border></Style>
+          </Tablix>
+        </ReportItems>
+        <Height>1.4in</Height>
+        <Style><Direction>RTL</Direction></Style>
+      </Body>
+      <Width>24in</Width>
+      <Page>
+        <PageHeight>17in</PageHeight><PageWidth>24.7in</PageWidth>
+        <LeftMargin>0.3in</LeftMargin><RightMargin>0.3in</RightMargin><TopMargin>0.3in</TopMargin><BottomMargin>0.3in</BottomMargin>
+        <Style/>
+      </Page>
+    </ReportSection>
+  </ReportSections>
+  <ReportParameters>
+    <ReportParameter Name="Pro"><DataType>Integer</DataType><Nullable>true</Nullable><Prompt>سفارش تولید محصول نهایی</Prompt></ReportParameter>
+    <ReportParameter Name="StartDate"><DataType>DateTime</DataType><Prompt>از تاریخ</Prompt></ReportParameter>
+    <ReportParameter Name="EndDate"><DataType>DateTime</DataType><Prompt>تا تاریخ</Prompt></ReportParameter>
+  </ReportParameters>
+  <Language>fa-IR</Language>
+  <ConsumeContainerWhitespace>true</ConsumeContainerWhitespace>
+</Report>
