@@ -1,0 +1,75 @@
+name: Fix RDL parameter layout
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-rdl-parameter-layout.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix-rdl:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add parameter layout
+        shell: python
+        run: |
+          from pathlib import Path
+
+          source = Path('artifacts/production-order-material-planning-final-optimized.rdl')
+          target = Path('artifacts/production-order-material-planning-final-optimized-parameter-layout-fixed.rdl')
+          text = source.read_text(encoding='utf-8')
+
+          layout = '''  <ReportParametersLayout>
+    <GridLayoutDefinition>
+      <NumberOfColumns>3</NumberOfColumns>
+      <NumberOfRows>1</NumberOfRows>
+      <CellDefinitions>
+        <CellDefinition>
+          <ColumnIndex>0</ColumnIndex>
+          <RowIndex>0</RowIndex>
+          <ParameterName>Pro</ParameterName>
+        </CellDefinition>
+        <CellDefinition>
+          <ColumnIndex>1</ColumnIndex>
+          <RowIndex>0</RowIndex>
+          <ParameterName>StartDate</ParameterName>
+        </CellDefinition>
+        <CellDefinition>
+          <ColumnIndex>2</ColumnIndex>
+          <RowIndex>0</RowIndex>
+          <ParameterName>EndDate</ParameterName>
+        </CellDefinition>
+      </CellDefinitions>
+    </GridLayoutDefinition>
+  </ReportParametersLayout>
+'''
+
+          if '<ReportParametersLayout>' in text:
+              start = text.index('  <ReportParametersLayout>')
+              end = text.index('  </ReportParametersLayout>', start) + len('  </ReportParametersLayout>\n')
+              text = text[:start] + layout + text[end:]
+          else:
+              marker = '  </ReportParameters>\n'
+              if marker not in text:
+                  raise RuntimeError('ReportParameters closing element not found')
+              text = text.replace(marker, marker + layout, 1)
+
+          if text.count('<ReportParameter Name=') != 3:
+              raise RuntimeError('Expected exactly three report parameters')
+          if text.count('<CellDefinition>') != 3:
+              raise RuntimeError('Expected exactly three parameter layout cells')
+
+          target.write_text(text, encoding='utf-8', newline='\n')
+
+      - name: Commit corrected RDL
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add artifacts/production-order-material-planning-final-optimized-parameter-layout-fixed.rdl
+          git commit -m "Fix RDL parameter panel layout"
+          git push
